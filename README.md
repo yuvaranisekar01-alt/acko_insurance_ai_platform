@@ -1,111 +1,127 @@
 Acko Insurance AI Platform
 
-An AI-powered insurance platform combining a RAG-based policy chatbot, ML-driven premium and claims prediction, and a live management analytics dashboard — built on synthetic Acko-style data for educational/portfolio purposes.
+An end-to-end insurance platform built on synthetic Acko-style data: a RAG chatbot grounded in policy PDFs, ML-based premium quoting, photo-assisted claims assessment, and a live management dashboard. All modules share one PostgreSQL database, and the app is deployed on AWS EC2 with S3 storage.
+
+Data note: all datasets (quotations and claims) are synthetic and were provided for this project. Model scores in this README describe performance on that synthetic data, not on real insurance data.
 
 Project Status
-Module	Status	Description
-1. RAG Chatbot	✅ Complete	Answers policy questions from Acko FAQ/T&C PDFs
-2. Premium Predictor	✅ Complete	ML-based annual premium quoting
-3. Claims Assessment	✅ Complete	Photo-based damage analysis + claim amount/approval prediction
-4. Management Dashboard	✅ Complete	Live KPIs and charts across all modules
-5. Manager AI Assistant	⏳ Not built	Stretch goal — natural language business queries over Postgres
+Module	Status	Summary
+1. RAG Chatbot	Built	Answers policy questions from 3 Acko PDFs; conversations logged
+2. Premium Predictor	Built	Random Forest premium model, SHAP explainability, quotes stored
+3. Claims Assessment	Built	Gemini Vision photo analysis + 4 ML models; photos and forms stored in S3
+4. Management Dashboard	Built	Live KPIs and charts, password-protected
+5. Manager AI Assistant	Not built	Natural-language-to-SQL assistant was out of scope
+AWS deployment	Built (see limitations)	EC2 + S3; PostgreSQL runs on the EC2 instance (no RDS)
 
-All four completed modules are fully wired to a shared PostgreSQL database, so activity in one module (e.g. chatbot conversations, quotations, claims) is visible in the Module 4 dashboard in real time.
+Architecture
 
-┌─────────────────┐
-                    │   PostgreSQL     │
-                    │  (shared state)  │
-                    │                  │
-                    │ quotations       │
-                    │ claims           │
-                    │ claim_submissions│
-                    │ chat_logs        │
-                    └────────┬─────────┘
-                              │
-        ┌──────────┬─────────┼─────────┬──────────┐
-        │          │         │         │
-   ┌────▼───┐ ┌────▼───┐┌────▼───┐┌────▼─────┐
-   │Module 1│ │Module 2││Module 3││ Module 4  │
-   │Chatbot │ │Premium ││Claims  ││ Dashboard │
-   │        │ │Predictor││Assess.││           │
-   │LangChain│ │Sklearn ││Sklearn ││ Plotly/   │
-   │+ Chroma│ │+ SHAP  ││+ Gemini││ Altair    │
-   │+ Gemini│ │        ││ Vision ││           │
-   └────────┘ └────────┘└────────┘└──────────┘
+Browser ──► EC2 (Ubuntu 24.04, t3.small) :8501 ──► Streamlit (app/main.py)
+                 │                                    │
+                 │                                    ├─► PostgreSQL (same instance, localhost)
+                 │                                    ├─► ChromaDB (local folder)
+                 │                                    ├─► Gemini API (chat, embeddings, vision)
+                 └── IAM role ───────────────────────► S3 (models/, claims/images/, claims/forms/)
 
-Module 1 — RAG Chatbot
+PostgreSQL tables:
 
-Purpose: Answers customer questions about motor and health insurance policies, grounded strictly in Acko's policy documents (no hallucinated answers).
+Table	Written by	Contents
+quotations	Premium Predictor	Inputs and predicted premium per quote
+claims	load_claims.py (one-time)	250,000 historical synthetic claims
+claim_submissions	Claims Assessment	New claim inputs and model predictions
+chat_logs	Chatbot	Each question and answer
 
-Tech stack: LangChain (LCEL), ChromaDB, Google Gemini (gemini-embedding-2-preview for embeddings, gemini-3.5-flash for generation)
 
-Key design decision: The system prompt explicitly instructs the model to answer only from retrieved context and to state clearly when information isn't available — verified via out-of-scope test questions (e.g. weather, unrelated insurance products) that correctly return "I don't have that information" rather than a fabricated answer.
+Modules
+1. RAG Chatbot
 
-Module 2 — Premium Predictor
+Knowledge base: 3 PDFs (FAQ, Motor policy T&C, Health policy T&C), 595 chunks (RecursiveCharacterTextSplitter, chunk size 800, overlap 100).
+Retrieval: Gemini embeddings stored in ChromaDB (persisted in data/processed/chroma_db); top-3 chunks per question.
+Generation: LangChain LCEL chain (retriever | format_docs → prompt → LLM → parser). The prompt tells the model to answer only from retrieved context and to say so when the answer is not there. This was checked with out-of-scope questions (weather, unrelated products), which are declined.
+Logging: every question and answer is written to chat_logs, which the dashboard reads.
+Free-tier note: embedding the 595 chunks required batches of 50 with a pause between batches to stay under rate limits (about 12 minutes).
 
-Purpose: Predicts annual insurance premium for a new car/bike customer, given vehicle, customer, and policy details.
+2. Premium Predictor
 
-Data: Combined car + bike quotation data (350,000 rows)
+Data: 350,000 quotations (150,000 bike + 200,000 car).
+Missing values: structural gaps (a bike row has no car-only field) were labelled differently from informative gaps (a car customer with no previous insurer became "First time buyer").
+Leakage: the five premium components that sum to the target (od_premium_before_ncb, ncb_discount_amount, tp_premium, addon_premium, gst_amount) were excluded from the features.
+Encoding: one-hot for low-cardinality columns, target encoding for high-cardinality ones, MultiLabelBinarizer for the multi-value add-ons list. All encoders were fitted on the training split only.
+Feature selection: VIF and Random Forest feature importance.
 
-Model comparison:
+Model	MAE (₹)	RMSE (₹, from MSE)	R²
+Linear Regression (baseline)	16,941	≈ 34,765	0.72
+Random Forest (depth ≈ 45)	2,237	≈ 6,474	0.99
+XGBoost	2,606	≈ 6,137	0.99
+Random Forest, max_depth=15 (final)	2,473	not computed	0.9895
 
-Model	MAE	R²
-Linear Regression (baseline)	₹16,940	0.72
-Random Forest	₹2,237	0.99
-XGBoost	₹2,606	0.99
+3. Claims Assessment
 
-Random Forest selected as final model (depth constrained to 15 after the initial depth-45 model showed clear overfitting signs; performance held at R²=0.9895 with much faster inference and SHAP compatibility).
+Photo analysis: an uploaded damage photo is sent to Gemini Vision, which returns damage type, severity (1-10), number of parts and affected parts as JSON. These fill the form for the user to review and edit.
+Four independent models: claim amount and approval, separately for bikes and cars (the two vehicle types have different features).
+Target meaning: claim_amount is the assessed claim value; rejected claims also carry an amount, so it is not an actual payout.
+Leakage: approval_probability (correlation 0.74 with the approval label) was excluded from all models.
+Class imbalance: about 87% approved, 13% rejected. class_weight='balanced' raised recall on rejected claims at some cost in precision.
+Target encoding was fitted separately against each target.
 
-Top drivers (SHAP-confirmed): IDV (insured value), Policy Type (Comprehensive vs Third Party), NCB %, vehicle model, city risk score — all directionally consistent with real insurance pricing logic.
+Model	Result
+Bike claim amount	R² 0.955, MAE ₹2,987
+Car claim amount	R² 0.993, MAE ₹26,140
 
-Storage: Every quote submitted through the Streamlit form is saved to the quotations table.
+Approval model	Accuracy	F1 (approved class)	Macro F1	Rejected recall before → after balancing
+Bike	92.1%	0.954	0.83	0.57 → 0.80
+Car	91.3%	0.948	0.85	0.65 → 0.87
 
-Module 3 — Claims Assessment
+The balanced setting accepts more false alarms (rejected precision about 0.62-0.65) to miss fewer genuinely rejectable claims, which suits a review workflow. SHAP on the approval models shows claim history, theft and fire damage, and damage severity pushing predictions toward rejection.
 
-Purpose: Given an uploaded damage photo and claim details, predicts (a) the likely claim payout amount and (b) approval likelihood.
+4. Management Dashboard
 
-Design decision — 4 independent models: Rather than one combined model, built separate amount-regression and approval-classification models for cars and bikes, since the two vehicle types have meaningfully different feature sets (e.g. rider_experience_years is bike-only, engine_protection_addon is car-only) and different claim patterns.
+Password-protected (MANAGER_PASSWORD). Shows claim volume for the latest day, last 7 and last 30 days, average claim amount by vehicle type, approval rate, total quotations and average premium, top cities by claim volume (Plotly), claim trend over time (Altair), top chatbot questions this week, and claims flagged for review (approval probability below 40%). The claims data is historical, so the "latest day / 7 / 30 days" cards are measured relative to the newest date in the data, not today's calendar date.
 
-Model	Metric	Score
-Bike — Claim Amount	R²	0.955
-Car — Claim Amount	R²	0.993
-Bike — Approval	Accuracy / F1	92.1% / 0.954
-Car — Approval	Accuracy / F1	91.3% / 0.948
+Run Locally
+1.Clone the repo and create a virtual environment, then pip install -r requirements.txt.
+2.Install PostgreSQL and create a database, then run db/schema.sql against it (it enables the pgcrypto extension).
+3.Create .env in the project root
+4.Put the raw CSVs in data/raw/ (acko_bike_claims.csv, acko_car_claims.csv), then load the claims once from the project root.
 
-SHAP insight: The approval models learned recognizable fraud-risk patterns — high claim history, theft/fire damage types, and very new policies at time of claim all push predictions toward rejection.
+AWS Deployment (EC2 + S3)
 
-Known limitation: Photos are analyzed in-session only and are not persisted to cloud storage (AWS S3) — deferred due to project timeline. The pipeline is designed so S3 upload could be added as a drop-in step between photo upload and Vision analysis.
+This is the setup that was deployed. The same steps with more detail are in DEPLOYMENT.md.
 
-Storage: Every claim submission + prediction is saved to claim_submissions.
+1. Account and safety
 
-Module 4 — Management Dashboard
+Create an AWS account, complete identity verification, and set a zero-spend budget alert.
+Secure the login with a second factor. Stop the instance when it is not in use.
 
-Purpose: Live business KPIs and visualizations for internal managers, pulling from all other modules' shared data.
+2. EC2 instance
 
-Tech stack: Plotly (bar charts), Altair (trend charts), password-gated access
+Ubuntu Server 24.04 LTS (x86_64), t3.small (2 GiB RAM), 30 GiB storage, new key pair (.pem, never committed).
+Security group inbound rules, with the source set to your own IP (x.x.x.x/32): SSH (22) and Custom TCP 8501. Do not open 5432. Open 8501 publicly only during a demo.
+The public IP changes every time the instance is stopped and started.
 
-KPIs & charts:
+Docker (provided): Dockerfile and .dockerignore build an image containing only the code; models, data and .env are mounted at run time. This was written from the deployment steps above and the app was deployed directly on EC2, so the image build has not been verified on the server.
 
-➡️Claims volume (latest day / 7-day / 30-day, relative to the dataset's own most recent date rather than ➡️real calendar time, since claims data is historical)
-➡️Average predicted claim payout, by vehicle type
-➡️Claim approval rate
-➡️Total quotations generated + average premium quoted
-➡️Top 10 cities by claim volume (Plotly)
-➡️Claim volume trend over time (Altair)
-➡️Top 10 chatbot questions this week (from chat_logs)
-➡️Claims flagged for human review (approval probability < 40%)
+Key Design Decisions
 
-Known Limitations & Future Work
-➡️Module 5 (Manager AI Assistant) not built — would use LangChain's SQL agent toolkit over the same Postgres database used by Module 4.
-➡️AWS deployment (EC2/RDS/S3) and Docker containerization were scoped in the original brief but deferred given project timeline — the app currently runs locally against a local Postgres instance. Models are stored locally via joblib rather than S3.
-➡️Gemini Vision (Module 3) is rate-limited on the free tier (5-15 requests/minute depending on model) — acceptable for demo/portfolio use, would need a paid tier or request queuing for production.
-➡️Approval classifier recall on rejected claims (80-87%) still has room for improvement — SMOTE-based oversampling or threshold tuning are natural next steps beyond the class_weight='balanced' fix already applied.
+Leakage checks before modelling: removed target components (premium), and a column derived from the label (approval_probability); fitted every encoder on training data only.
+Overfitting: capped Random Forest depth at 15 after the first model showed very deep trees.
+Imbalance: chose recall on rejected claims over headline accuracy and documented the trade-off.
+Separate models per vehicle type: features differ between bikes and cars.
+Grounded chatbot: retrieval plus a prompt that refuses to answer outside the documents.
+No stored AWS keys: the instance uses an IAM role.
 
-Tech Stack Summary
-Category	Tools
-ML	scikit-learn, XGBoost, SHAP, category_encoders
-LLM / RAG	LangChain, ChromaDB, Google Gemini API
-Data	pandas, numpy, PostgreSQL, SQLAlchemy
-App	Streamlit
-Visualization	Plotly, Altair, matplotlib, seaborn
+Known Limitations
+
+Module 5 (text-to-SQL manager assistant) was not built.
+The chatbot only answers policy questions. It does not route requests to the quotation or claims forms, which the original brief described.
+No user accounts: quotations and claims are stored with timestamps but no user ID.
+PostgreSQL runs on the EC2 instance, not on RDS.
+Models are loaded from local disk. S3 holds a copy and the claims photos and forms, but the app does not download models from S3 at startup.
+Evaluation is a single train/test split on synthetic data; there is no cross-validation or hyperparameter search. The very high premium R² reflects how closely the synthetic premium follows a few inputs and should not be expected on real data.
+The app is served over plain HTTP on port 8501, restricted to an allowed IP, with no domain or HTTPS.
+Gemini free-tier limits and demand spikes (rate limits, occasional 503 errors) can slow the chatbot and photo analysis. Gemini model names change often; update the names in rag_chatbot.py and vision.py if a call returns 404.
+Docker image not verified on the server.
+
+Tech Stack
+
+Python 3.12, scikit-learn, XGBoost, SHAP, category_encoders, pandas, NumPy · LangChain, ChromaDB, Google Gemini · PostgreSQL, SQLAlchemy · Streamlit, Plotly, Altair · AWS EC2, S3, IAM · Docker
 

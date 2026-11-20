@@ -55,6 +55,7 @@ claims_table_cols = [
 ]
 combined = combined[[c for c in claims_table_cols if c in combined.columns]]
 
+combined["incident_date"] = pd.to_datetime(combined["incident_date"]).dt.date
 combined.to_sql("claims", engine, if_exists="append", index=False)
 
 print(f"Loaded {len(combined)} rows into claims table.")
