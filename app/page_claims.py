@@ -5,8 +5,10 @@ import datetime
 from PIL import Image
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src", "module03_claims"))
+from s3_utils import save_claim_to_s3  # noqa: E402
 from vision import extract_damage_info  # noqa: E402
 from predictor import load_all_artifacts, predict_claim, save_claim_submission  # noqa: E402
+
 
 
 CURRENT_YEAR = datetime.datetime.now().year
@@ -158,8 +160,19 @@ if submitted:
     )
 
     try:
+        image_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
+        image_name = uploaded_file.name if uploaded_file is not None else None
+        image_key, form_key = save_claim_to_s3(
+            image_bytes, image_name, {**raw_input, "vehicle_type": vehicle_type, **prediction}
+        )
+        st.info(f"Saved to S3: {form_key}")
+    except Exception as e:
+        st.warning(f"Could not save to S3: {e}")
+
+    try:
         save_claim_submission({**raw_input, "vehicle_type": vehicle_type}, prediction)
         st.info("Claim submission saved to database.")
     except Exception as e:
         st.warning(f"Prediction succeeded, but saving to database failed: {e}")
+
 
